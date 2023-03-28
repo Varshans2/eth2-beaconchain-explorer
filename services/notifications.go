@@ -1,7 +1,9 @@
 package services
 
 import (
+	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"eth2-exporter/db"
 	ethclients "eth2-exporter/ethClients"
 	"eth2-exporter/mail"
@@ -10,6 +12,7 @@ import (
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
+	"math/big"
 	"net/url"
 	"strconv"
 	"strings"
@@ -98,7 +101,33 @@ func collectNotifications() map[uint64]map[types.EventName][]types.Notification 
 	// Network liveness
 	err = collectNetworkNotifications(notificationsByUserID, types.NetworkLivenessIncreasedEventName)
 	if err != nil {
-		logger.Errorf("error collecting tax report notifications: %v", err)
+		logger.Errorf("error collecting network notifications: %v", err)
+	}
+
+	// Rocketpool fee comission alert
+	err = collectRocketpoolComissionNotifications(notificationsByUserID, types.RocketpoolCommissionThresholdEventName)
+	if err != nil {
+		logger.Errorf("error collecting rocketpool commision: %v", err)
+	}
+
+	err = collectRocketpoolRewardClaimRoundNotifications(notificationsByUserID, types.RocketpoolNewClaimRoundStartedEventName)
+	if err != nil {
+		logger.Errorf("error collecting new rocketpool claim round: %v", err)
+	}
+
+	err = collectRocketpoolRPLColleteralNotifications(notificationsByUserID, types.RocketpoolColleteralMaxReached)
+	if err != nil {
+		logger.Errorf("error collecting rocketpool max colleteral: %v", err)
+	}
+
+	err = collectRocketpoolRPLColleteralNotifications(notificationsByUserID, types.RocketpoolColleteralMinReached)
+	if err != nil {
+		logger.Errorf("error collecting rocketpool min colleteral: %v", err)
+	}
+
+	err = collectSyncCommittee(notificationsByUserID, types.SyncCommitteeSoon)
+	if err != nil {
+		logger.Errorf("error collecting sync committee: %v", err)
 	}
 
 	return notificationsByUserID
@@ -1330,6 +1359,376 @@ func collectNetworkNotifications(notificationsByUserID map[uint64]map[types.Even
 			}
 			notificationsByUserID[r.UserID][n.GetEventName()] = append(notificationsByUserID[r.UserID][n.GetEventName()], n)
 		}
+	}
+
+	return nil
+}
+
+type rocketpoolNotification struct {
+	SubscriptionID uint64
+	UserID         uint64
+	Epoch          uint64
+	EventFilter    string
+	EventName      types.EventName
+	ExtraData      string
+}
+
+func (n *rocketpoolNotification) GetEmailAttachment() *types.EmailAttachment {
+	return nil
+}
+
+func (n *rocketpoolNotification) GetSubscriptionID() uint64 {
+	return n.SubscriptionID
+}
+
+func (n *rocketpoolNotification) GetEpoch() uint64 {
+	return n.Epoch
+}
+
+func (n *rocketpoolNotification) GetEventName() types.EventName {
+	return n.EventName
+}
+
+func (n *rocketpoolNotification) GetInfo(includeUrl bool) string {
+	switch n.EventName {
+	case types.RocketpoolCommissionThresholdEventName:
+		return fmt.Sprintf(`The current RPL commission rate of %v has reached your configured threshold.`, n.ExtraData)
+	case types.RocketpoolNewClaimRoundStartedEventName:
+		return fmt.Sprintf(`A new reward round has started. You can now claim your rewards from the previous round.`)
+	case types.RocketpoolColleteralMaxReached:
+		return `Your RPL collateral has reached your configured threshold at 150%.`
+	case types.RocketpoolColleteralMinReached:
+		return `Your RPL collateral has reached your configured threshold at 10%.`
+	case types.SyncCommitteeSoon:
+		extras := strings.Split(n.ExtraData, "|")
+		return fmt.Sprintf(`Your validator %v has been elected to be part of the next sync committee. The additional duties start at epoch %v, which is in roughly 24 hours and will last for a day until epoch %v.`, extras[0], extras[1], extras[2])
+	}
+
+	return ""
+}
+
+func (n *rocketpoolNotification) GetTitle() string {
+	switch n.EventName {
+	case types.RocketpoolCommissionThresholdEventName:
+		return fmt.Sprintf(`Rocketpool Commission`)
+	case types.RocketpoolNewClaimRoundStartedEventName:
+		return fmt.Sprintf(`Rocketpool Claim Available`)
+	case types.RocketpoolColleteralMaxReached:
+		return `Rocketpool Max Collateral`
+	case types.RocketpoolColleteralMinReached:
+		return `Rocketpool Min Collateral`
+	case types.SyncCommitteeSoon:
+		return `Sync Committee Duty`
+	}
+	return ""
+}
+
+func (n *rocketpoolNotification) GetEventFilter() string {
+	return n.EventFilter
+}
+
+func collectRocketpoolComissionNotifications(notificationsByUserID map[uint64]map[types.EventName][]types.Notification, eventName types.EventName) error {
+	fee := 0.0
+	err := db.DB.Get(&fee, `
+		select current_node_fee from rocketpool_network_stats order by id desc LIMIT 1;
+	`)
+
+	if err != nil {
+		return err
+	}
+
+	if fee > 0 {
+
+		var dbResult []struct {
+			SubscriptionID uint64 `db:"id"`
+			UserID         uint64 `db:"user_id"`
+			Epoch          uint64 `db:"created_epoch"`
+			EventFilter    string `db:"event_filter"`
+		}
+
+		err := db.FrontendDB.Select(&dbResult, `
+			SELECT us.id, us.user_id, us.created_epoch, us.event_filter                 
+			FROM users_subscriptions AS us
+			WHERE us.event_name=$1 AND (us.last_sent_ts <= NOW() - INTERVAL '8 hours' OR us.last_sent_ts IS NULL) AND (us.event_threshold <= $2 OR (us.event_threshold < 0 AND us.event_threshold * -1 >= $2));
+			`,
+			utils.GetNetwork()+":"+string(eventName), fee)
+
+		if err != nil {
+			return err
+		}
+
+		for _, r := range dbResult {
+			n := &rocketpoolNotification{
+				SubscriptionID: r.SubscriptionID,
+				UserID:         r.UserID,
+				Epoch:          r.Epoch,
+				EventFilter:    r.EventFilter,
+				EventName:      eventName,
+				ExtraData:      strconv.FormatInt(int64(fee*100), 10) + "%",
+			}
+			if _, exists := notificationsByUserID[r.UserID]; !exists {
+				notificationsByUserID[r.UserID] = map[types.EventName][]types.Notification{}
+			}
+			if _, exists := notificationsByUserID[r.UserID][n.GetEventName()]; !exists {
+				notificationsByUserID[r.UserID][n.GetEventName()] = []types.Notification{}
+			}
+			notificationsByUserID[r.UserID][n.GetEventName()] = append(notificationsByUserID[r.UserID][n.GetEventName()], n)
+		}
+	}
+
+	return nil
+}
+
+func collectRocketpoolRewardClaimRoundNotifications(notificationsByUserID map[uint64]map[types.EventName][]types.Notification, eventName types.EventName) error {
+	var ts int64
+	err := db.DB.Get(&ts, `
+		select date_part('epoch', claim_interval_time_start)::int from rocketpool_network_stats order by id desc LIMIT 1;
+	`)
+
+	if err != nil {
+		return err
+	}
+
+	if ts+3*60*60 > time.Now().Unix() {
+
+		var dbResult []struct {
+			SubscriptionID uint64 `db:"id"`
+			UserID         uint64 `db:"user_id"`
+			Epoch          uint64 `db:"created_epoch"`
+			EventFilter    string `db:"event_filter"`
+		}
+
+		err := db.FrontendDB.Select(&dbResult, `
+			SELECT us.id, us.user_id, us.created_epoch, us.event_filter                 
+			FROM users_subscriptions AS us
+			WHERE us.event_name=$1 AND (us.last_sent_ts <= NOW() - INTERVAL '5 hours' OR us.last_sent_ts IS NULL);
+			`,
+			utils.GetNetwork()+":"+string(eventName))
+
+		if err != nil {
+			return err
+		}
+
+		for _, r := range dbResult {
+			n := &rocketpoolNotification{
+				SubscriptionID: r.SubscriptionID,
+				UserID:         r.UserID,
+				Epoch:          r.Epoch,
+				EventFilter:    r.EventFilter,
+				EventName:      eventName,
+			}
+			if _, exists := notificationsByUserID[r.UserID]; !exists {
+				notificationsByUserID[r.UserID] = map[types.EventName][]types.Notification{}
+			}
+			if _, exists := notificationsByUserID[r.UserID][n.GetEventName()]; !exists {
+				notificationsByUserID[r.UserID][n.GetEventName()] = []types.Notification{}
+			}
+			notificationsByUserID[r.UserID][n.GetEventName()] = append(notificationsByUserID[r.UserID][n.GetEventName()], n)
+		}
+	}
+
+	return nil
+}
+
+func collectRocketpoolRPLColleteralNotifications(notificationsByUserID map[uint64]map[types.EventName][]types.Notification, eventName types.EventName) error {
+
+	pubkeys, subMap, err := db.GetSubsForEventFilter(eventName)
+	if err != nil {
+		return fmt.Errorf("error getting subscriptions for missted attestations %w", err)
+	}
+
+	type dbResult struct {
+		Address     []byte
+		RPLStake    BigFloat `db:"rpl_stake"`
+		RPLStakeMin BigFloat `db:"min_rpl_stake"`
+		RPLStakeMax BigFloat `db:"max_rpl_stake"`
+	}
+
+	events := make([]dbResult, 0)
+	batchSize := 5000
+	dataLen := len(pubkeys)
+	for i := 0; i < dataLen; i += batchSize {
+		var keys [][]byte
+		start := i
+		end := i + batchSize
+
+		if dataLen < end {
+			end = dataLen
+		}
+
+		keys = pubkeys[start:end]
+
+		var partial []dbResult
+
+		err = db.DB.Select(&partial, `
+		SELECT address, rpl_stake, min_rpl_stake, max_rpl_stake                    
+		FROM rocketpool_nodes WHERE address = ANY($1)`, pq.ByteaArray(keys))
+		if err != nil {
+			return err
+		}
+		events = append(events, partial...)
+	}
+
+	for _, r := range events {
+		subs, ok := subMap[hex.EncodeToString(r.Address)]
+		if !ok {
+			continue
+		}
+		sub := subs[0]
+		var alertConditionMet bool = false
+
+		if sub.EventThreshold >= 0 {
+			var threshold float64 = sub.EventThreshold
+			if threshold == 0 {
+				threshold = 1.0
+			}
+			if eventName == types.RocketpoolColleteralMaxReached {
+				alertConditionMet = r.RPLStake.bigFloat().Cmp(r.RPLStakeMax.bigFloat().Mul(r.RPLStakeMax.bigFloat(), bigFloat(threshold))) >= 1
+			} else {
+				alertConditionMet = r.RPLStake.bigFloat().Cmp(r.RPLStakeMin.bigFloat().Mul(r.RPLStakeMin.bigFloat(), bigFloat(threshold))) <= -1
+			}
+		} else {
+			if eventName == types.RocketpoolColleteralMaxReached {
+				alertConditionMet = r.RPLStake.bigFloat().Cmp(r.RPLStakeMax.bigFloat().Mul(r.RPLStakeMax.bigFloat(), bigFloat(sub.EventThreshold*-1))) <= -1
+			} else {
+				alertConditionMet = r.RPLStake.bigFloat().Cmp(r.RPLStakeMax.bigFloat().Mul(r.RPLStakeMin.bigFloat(), bigFloat(sub.EventThreshold*-1))) >= -1
+			}
+		}
+
+		if !alertConditionMet {
+			continue
+		}
+
+		currentEpoch := LatestEpoch()
+		if sub.LastEpoch != nil {
+			lastSentEpoch := *sub.LastEpoch
+			if lastSentEpoch >= currentEpoch-80 || currentEpoch < sub.CreatedEpoch {
+				continue
+			}
+		}
+
+		n := &rocketpoolNotification{
+			SubscriptionID: *sub.ID,
+			UserID:         *sub.UserID,
+			Epoch:          currentEpoch,
+			EventFilter:    sub.EventFilter,
+			EventName:      eventName,
+		}
+		if _, exists := notificationsByUserID[*sub.UserID]; !exists {
+			notificationsByUserID[*sub.UserID] = map[types.EventName][]types.Notification{}
+		}
+		if _, exists := notificationsByUserID[*sub.UserID][n.GetEventName()]; !exists {
+			notificationsByUserID[*sub.UserID][n.GetEventName()] = []types.Notification{}
+		}
+		notificationsByUserID[*sub.UserID][n.GetEventName()] = append(notificationsByUserID[*sub.UserID][n.GetEventName()], n)
+	}
+
+	return nil
+}
+
+type BigFloat big.Float
+
+func (b *BigFloat) Value() (driver.Value, error) {
+	if b != nil {
+		return (*big.Float)(b).String(), nil
+	}
+	return nil, nil
+}
+
+func (b *BigFloat) Scan(value interface{}) error {
+	if value == nil {
+		return errors.New("Can not cast nil to BigFloat")
+	}
+
+	switch t := value.(type) {
+	case float64:
+		(*big.Float)(b).SetFloat64(value.(float64))
+	case []uint8:
+		_, ok := (*big.Float)(b).SetString(string(value.([]uint8)))
+		if !ok {
+			return fmt.Errorf("failed to load value to []uint8: %v", value)
+		}
+	case string:
+		_, ok := (*big.Float)(b).SetString(value.(string))
+		if !ok {
+			return fmt.Errorf("failed to load value to []uint8: %v", value)
+		}
+	default:
+		return fmt.Errorf("Could not scan type %T into BigFloat", t)
+	}
+
+	return nil
+}
+
+func (b *BigFloat) bigFloat() *big.Float {
+	return (*big.Float)(b)
+}
+func bigFloat(x float64) *big.Float {
+	return new(big.Float).SetFloat64(x)
+}
+
+func collectSyncCommittee(notificationsByUserID map[uint64]map[types.EventName][]types.Notification, eventName types.EventName) error {
+
+	slotsPerSyncCommittee := utils.Config.Chain.EpochsPerSyncCommitteePeriod * utils.Config.Chain.SlotsPerEpoch
+	currentPeriod := LatestSlot() / slotsPerSyncCommittee
+	nextPeriod := currentPeriod + 1
+
+	var validators []struct {
+		PubKey string `db:"pubkey"`
+		Index  uint64 `db:"validatorindex"`
+	}
+	err := db.DB.Select(&validators, `SELECT encode(pubkey, 'hex') as pubkey, validators.validatorindex FROM sync_committees LEFT JOIN validators ON validators.validatorindex = sync_committees.validatorindex WHERE period = $1`, nextPeriod)
+
+	if err != nil {
+		return err
+	}
+
+	if len(validators) <= 0 {
+		return nil
+	}
+
+	var pubKeys []string
+	var mapping map[string]uint64 = make(map[string]uint64)
+	for _, val := range validators {
+		mapping[val.PubKey] = val.Index
+		pubKeys = append(pubKeys, val.PubKey)
+	}
+
+	var dbResult []struct {
+		SubscriptionID uint64 `db:"id"`
+		UserID         uint64 `db:"user_id"`
+		Epoch          uint64 `db:"created_epoch"`
+		EventFilter    string `db:"event_filter"`
+	}
+
+	err = db.FrontendDB.Select(&dbResult, `
+				SELECT us.id, us.user_id, us.created_epoch, us.event_filter            
+				FROM users_subscriptions AS us 
+				WHERE us.event_name=$1 AND (us.last_sent_ts <= NOW() - INTERVAL '26 hours' OR us.last_sent_ts IS NULL) AND event_filter = ANY($2);
+				`,
+		utils.GetNetwork()+":"+string(eventName), pq.StringArray(pubKeys),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	for _, r := range dbResult {
+		n := &rocketpoolNotification{
+			SubscriptionID: r.SubscriptionID,
+			UserID:         r.UserID,
+			Epoch:          r.Epoch,
+			EventFilter:    r.EventFilter,
+			EventName:      eventName,
+			ExtraData:      fmt.Sprintf("%v|%v|%v", mapping[r.EventFilter], nextPeriod*utils.Config.Chain.EpochsPerSyncCommitteePeriod, (nextPeriod+1)*utils.Config.Chain.EpochsPerSyncCommitteePeriod),
+		}
+		if _, exists := notificationsByUserID[r.UserID]; !exists {
+			notificationsByUserID[r.UserID] = map[types.EventName][]types.Notification{}
+		}
+		if _, exists := notificationsByUserID[r.UserID][n.GetEventName()]; !exists {
+			notificationsByUserID[r.UserID][n.GetEventName()] = []types.Notification{}
+		}
+		notificationsByUserID[r.UserID][n.GetEventName()] = append(notificationsByUserID[r.UserID][n.GetEventName()], n)
 	}
 
 	return nil
